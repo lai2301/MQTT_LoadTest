@@ -30,7 +30,7 @@ func LoadConfig() *Config {
 	pflag.StringVar(&cfg.TopicPrefix, "topic-prefix", "loadtest/", "Prefix for MQTT topics")
 	pflag.StringVar(&cfg.Username, "username", "auth", "MQTT username")
 	pflag.StringVar(&cfg.Password, "password", "auth", "MQTT password")
-	pflag.IntVar(&cfg.QoS, "qos", 0, "MQTT QoS level (0, 1, or 2)")
+	pflag.IntVar(&cfg.QoS, "qos", 1, "MQTT QoS level (0, 1, or 2)")
 	pflag.StringVar(&cfg.ClientPrefix, "prefix", "loadtest-client-", "Client ID prefix")
 	pflag.IntVar(&cfg.SubClients, "sub-clients", 50, "Number of subscribing clients")
 	pflag.BoolVar(&cfg.RetainMessage, "retain", false, "Retain published messages")

@@ -49,8 +49,8 @@ func main() {
 		}(client)
 	}
 
-	// Wait a bit for subscribers to connect and subscribe
-	time.Sleep(2 * time.Second)
+	// Increase wait time for subscribers to connect and subscribe
+	time.Sleep(3 * time.Second)
 
 	// Create and connect publisher clients
 	fmt.Printf("Creating %d publisher clients...\n", config.NumClients)

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"crypto/tls"
+	"strings"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -82,8 +84,24 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetClientID(clientID).
 		SetUsername(config.Username).
 		SetPassword(config.Password).
-		SetCleanSession(true).
-		SetAutoReconnect(true)
+		SetCleanSession(false).
+		SetAutoReconnect(true).
+		SetKeepAlive(30 * time.Second).
+		SetPingTimeout(10 * time.Second).
+		SetConnectionLostHandler(func(client mqtt.Client, err error) {
+			fmt.Printf("Connection lost for client %s: %v\n", clientID, err)
+		}).
+		SetOnConnectHandler(func(client mqtt.Client) {
+			fmt.Printf("Client %s connected successfully\n", clientID)
+		})
+
+	// Configure TLS if using SSL
+	if strings.HasPrefix(config.BrokerURL, "ssl://") {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true,  // Note: In production, you should properly verify certificates
+		}
+		opts.SetTLSConfig(tlsConfig)
+	}
 
 	if isSubscriber {
 		opts.SetDefaultPublishHandler(func(client mqtt.Client, msg mqtt.Message) {
@@ -129,19 +147,42 @@ func (c *Client) Start() {
 }
 
 func (c *Client) subscribeLoop() {
-	token := c.client.Subscribe(c.topic, byte(c.config.QoS), nil)
+	// Add subscription with callback to confirm subscription
+	token := c.client.Subscribe(c.topic, byte(c.config.QoS), func(client mqtt.Client, msg mqtt.Message) {
+		c.stats.mutex.Lock()
+		c.stats.ReceivedMessages++
+		c.stats.LastReceived[c.clientIndex] = time.Now()
+		c.stats.mutex.Unlock()
+
+		// Extract timestamp from payload for latency calculation
+		if len(msg.Payload()) >= 8 {
+			sentTime := string(msg.Payload()[:8])
+			if timestamp, err := strconv.ParseInt(sentTime, 10, 64); err == nil {
+				_ = time.Since(time.Unix(0, timestamp))
+			}
+		}
+	})
+
 	if token.Wait() && token.Error() != nil {
 		c.stats.mutex.Lock()
 		c.stats.Errors++
 		c.stats.mutex.Unlock()
+		fmt.Printf("Error subscribing to topic %s: %v\n", c.topic, token.Error())
 		return
 	}
 
 	<-c.stopChan
+
+	// Clean unsubscribe
+	if token := c.client.Unsubscribe(c.topic); token.Wait() && token.Error() != nil {
+		fmt.Printf("Error unsubscribing from topic %s: %v\n", c.topic, token.Error())
+	}
 }
 
 func (c *Client) publishLoop() {
-	ticker := time.NewTicker(time.Second / time.Duration(c.config.PublishRate))
+	// Use time.Ticker for more precise timing
+	publishInterval := time.Second / time.Duration(c.config.PublishRate)
+	ticker := time.NewTicker(publishInterval)
 	defer ticker.Stop()
 
 	payload := make([]byte, c.config.MessageSize)
@@ -164,23 +205,26 @@ func (c *Client) publishLoop() {
 				lastTime = time.Now()
 			}
 
-			_, err := rand.Read(payload)
-			if err != nil {
-				c.stats.mutex.Lock()
-				c.stats.Errors++
-				c.stats.mutex.Unlock()
-				continue
-			}
-
-			// Add timestamp to payload for latency calculation
+			// Generate message with timestamp
 			timestamp := time.Now().UnixNano()
-			copy(payload[0:8], []byte(fmt.Sprintf("%d", timestamp)))
+			timestampStr := fmt.Sprintf("%d", timestamp)
+			copy(payload[0:8], []byte(timestampStr))
+			
+			if len(payload) > 8 {
+				if _, err := rand.Read(payload[8:]); err != nil {
+					c.stats.mutex.Lock()
+					c.stats.Errors++
+					c.stats.mutex.Unlock()
+					continue
+				}
+			}
 
 			token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
 			if token.Wait() && token.Error() != nil {
 				c.stats.mutex.Lock()
 				c.stats.Errors++
 				c.stats.mutex.Unlock()
+				fmt.Printf("Error publishing to topic %s: %v\n", c.topic, token.Error())
 				continue
 			}
 
