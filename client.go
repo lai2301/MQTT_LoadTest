@@ -44,6 +44,22 @@ type ChannelStat struct {
 	SampleCount uint64
 }
 
+type ClientOptions struct {
+	MaxInflight     int
+	BatchSize       int
+	PublishTimeout  time.Duration
+	ConnectTimeout  time.Duration
+}
+
+func DefaultClientOptions() ClientOptions {
+	return ClientOptions{
+		MaxInflight:     100,
+		BatchSize:       10,
+		PublishTimeout:  5 * time.Second,
+		ConnectTimeout:  10 * time.Second,
+	}
+}
+
 func NewStats() *Stats {
 	return &Stats{
 		LastPublished: make(map[int]time.Time),
@@ -94,13 +110,17 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetAutoReconnect(true).
 		SetKeepAlive(30 * time.Second).
 		SetPingTimeout(10 * time.Second).
-		SetMaxReconnectInterval(5 * time.Second).
+		SetMaxReconnectInterval(1 * time.Second).
 		SetOrderMatters(false).
-		SetConnectionLostHandler(func(client mqtt.Client, err error) {
-			fmt.Printf("Connection lost for client %s: %v\n", clientID, err)
-		}).
+		SetConnectTimeout(10 * time.Second).
 		SetOnConnectHandler(func(client mqtt.Client) {
 			fmt.Printf("Client %s connected successfully\n", clientID)
+		}).
+		SetConnectionLostHandler(func(client mqtt.Client, err error) {
+			fmt.Printf("Connection lost for client %s: %v\n", clientID, err)
+			// Try to reconnect immediately
+			time.Sleep(100 * time.Millisecond)
+			client.Connect()
 		})
 
 	// Configure TLS if using SSL
@@ -197,6 +217,7 @@ func (c *Client) publishLoop() {
 		time.Sleep(time.Until(c.startTime))
 	}
 
+	// Use smaller intervals for more frequent publishing
 	publishInterval := time.Second / time.Duration(c.config.PublishRate)
 	ticker := time.NewTicker(publishInterval)
 	defer ticker.Stop()
@@ -205,51 +226,72 @@ func (c *Client) publishLoop() {
 	lastCount := uint64(0)
 	lastTime := time.Now()
 
-	// Pre-generate some random data
-	randomData := make([]byte, c.config.MessageSize*10)
-	_, _ = rand.Read(randomData)
+	// Pre-generate multiple random payloads
+	payloadPool := make([][]byte, 10)
+	for i := range payloadPool {
+		payloadPool[i] = make([]byte, c.config.MessageSize)
+		_, _ = rand.Read(payloadPool[i][8:]) // Leave space for timestamp
+	}
 
+	// Create a buffered channel for publish tokens
+	tokenChan := make(chan mqtt.Token, 100)
+	
+	// Start a goroutine to handle publish completions
+	go func() {
+		for token := range tokenChan {
+			if token.Wait() && token.Error() != nil {
+				c.stats.mutex.Lock()
+				c.stats.Errors++
+				c.stats.mutex.Unlock()
+				fmt.Printf("Error publishing to topic %s: %v\n", c.topic, token.Error())
+				continue
+			}
+
+			c.stats.mutex.Lock()
+			c.stats.PublishedMessages++
+			c.stats.LastPublished[c.clientIndex] = time.Now()
+			c.stats.mutex.Unlock()
+		}
+	}()
+
+	payloadIndex := 0
 	for {
 		select {
 		case <-c.stopChan:
+			close(tokenChan)
 			return
 		case <-ticker.C:
-			// Calculate and update rate every second
+			// Update stats every second
 			if time.Since(lastTime) >= time.Second {
 				c.stats.mutex.Lock()
 				currentCount := c.stats.PublishedMessages
-				rate := float64(currentCount-lastCount) / time.Since(lastTime).Seconds()
-				c.stats.UpdateChannelRate(c.clientIndex, rate)
-				lastCount = currentCount
-				c.stats.mutex.Unlock()
-				lastTime = time.Now()
+					rate := float64(currentCount-lastCount) / time.Since(lastTime).Seconds()
+					c.stats.UpdateChannelRate(c.clientIndex, rate)
+					lastCount = currentCount
+					c.stats.mutex.Unlock()
+					lastTime = time.Now()
 			}
 
-			// Generate message with timestamp
+			// Use pre-generated payload
+			copy(payload, payloadPool[payloadIndex])
+			payloadIndex = (payloadIndex + 1) % len(payloadPool)
+
+			// Update timestamp
 			timestamp := time.Now().UnixNano()
 			copy(payload[0:8], []byte(fmt.Sprintf("%d", timestamp)))
-			
-			// Use pre-generated random data
-			if len(payload) > 8 {
-				copy(payload[8:], randomData[:len(payload)-8])
-			}
 
-			// Publish without waiting for completion
+			// Publish without blocking
 			token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
-			go func() {
+			select {
+			case tokenChan <- token:
+			default:
+				// If channel is full, handle completion here
 				if token.Wait() && token.Error() != nil {
 					c.stats.mutex.Lock()
 					c.stats.Errors++
 					c.stats.mutex.Unlock()
-					fmt.Printf("Error publishing to topic %s: %v\n", c.topic, token.Error())
-					return
 				}
-
-				c.stats.mutex.Lock()
-				c.stats.PublishedMessages++
-				c.stats.LastPublished[c.clientIndex] = time.Now()
-				c.stats.mutex.Unlock()
-			}()
+			}
 		}
 	}
 }

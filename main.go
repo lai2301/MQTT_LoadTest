@@ -54,6 +54,8 @@ func main() {
 
 	// Create and connect publisher clients
 	fmt.Printf("Creating %d publisher clients...\n", config.NumClients)
+	
+	// Create all clients first
 	for i := 0; i < config.NumClients; i++ {
 		client, err := NewClient(i*2+1, config, stats, false)
 		if err != nil {
@@ -61,19 +63,20 @@ func main() {
 			continue
 		}
 		publishers[i] = client
-		wg.Add(1)
-
-		go func(c *Client) {
-			defer wg.Done()
-			c.Start()
-		}(client)
 	}
 
 	// Set synchronized start time for all publishers
-	publishStartTime := time.Now().Add(time.Second)
+	publishStartTime := time.Now().Add(2 * time.Second)
+	
+	// Start all publishers simultaneously
 	for _, pub := range publishers {
 		if pub != nil {
 			pub.SetStartTime(publishStartTime)
+			wg.Add(1)
+			go func(c *Client) {
+				defer wg.Done()
+				c.Start()
+			}(pub)
 		}
 	}
 
@@ -137,6 +140,8 @@ cleanup:
 	// Print final statistics
 	elapsed := time.Since(startTime).Seconds()
 	fmt.Printf("\n=== Final Test Results ===\n")
+	fmt.Printf("Total Publishers: %d\n", config.NumClients)
+	fmt.Printf("Total Subscribers: %d\n", config.SubClients)
 	fmt.Printf("Test Duration: %.2f seconds\n", elapsed)
 	fmt.Printf("Total Messages Published: %d\n", stats.PublishedMessages)
 	fmt.Printf("Total Messages Received: %d\n", stats.ReceivedMessages)
