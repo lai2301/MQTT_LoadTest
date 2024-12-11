@@ -32,37 +32,76 @@ func main() {
 	subscribers := make([]*Client, config.SubClients)
 	var wg sync.WaitGroup
 
-	// Create and connect subscriber clients first
+	// Create subscriber clients in parallel
 	fmt.Printf("Initializing %d pairs of publishers and subscribers...\n", config.SubClients)
-	for i := 0; i < config.SubClients; i++ {
-		client, err := NewClient(i*2, config, stats, true)
-		if err != nil {
-			fmt.Printf("Error creating client pair %d: %v\n", i, err)
-			continue
-		}
-		subscribers[i] = client
-		wg.Add(1)
+	subWg := sync.WaitGroup{}
+	subChan := make(chan error, config.SubClients)
 
-		go func(c *Client) {
-			defer wg.Done()
-			c.Start()
-		}(client)
+	for i := 0; i < config.SubClients; i++ {
+		subWg.Add(1)
+		go func(index int) {
+			defer subWg.Done()
+			client, err := NewClient(index*2, config, stats, true)
+			if err != nil {
+				fmt.Printf("Error creating subscriber %d: %v\n", index, err)
+				subChan <- err
+				return
+			}
+			subscribers[index] = client
+			go client.Start()
+		}(i)
+	}
+
+	// Wait for all subscribers to be created
+	subWg.Wait()
+	close(subChan)
+
+	// Check for subscriber creation errors
+	errCount := 0
+	for err := range subChan {
+		if err != nil {
+			errCount++
+		}
+	}
+	if errCount > 0 {
+		fmt.Printf("Warning: %d subscribers failed to initialize\n", errCount)
 	}
 
 	// Increase wait time for subscribers to connect and subscribe
 	time.Sleep(3 * time.Second)
 
-	// Create and connect publisher clients
+	// Create publisher clients in parallel
 	fmt.Printf("Creating %d publisher clients...\n", config.NumClients)
-	
-	// Create all clients first
+	pubWg := sync.WaitGroup{}
+	pubChan := make(chan error, config.NumClients)
+
 	for i := 0; i < config.NumClients; i++ {
-		client, err := NewClient(i*2+1, config, stats, false)
+		pubWg.Add(1)
+		go func(index int) {
+			defer pubWg.Done()
+			client, err := NewClient(index*2+1, config, stats, false)
+			if err != nil {
+				fmt.Printf("Error creating publisher %d: %v\n", index, err)
+				pubChan <- err
+				return
+			}
+			publishers[index] = client
+		}(i)
+	}
+
+	// Wait for all publishers to be created
+	pubWg.Wait()
+	close(pubChan)
+
+	// Check for publisher creation errors
+	errCount = 0
+	for err := range pubChan {
 		if err != nil {
-			fmt.Printf("Error creating publisher client %d: %v\n", i, err)
-			continue
+			errCount++
 		}
-		publishers[i] = client
+	}
+	if errCount > 0 {
+		fmt.Printf("Warning: %d publishers failed to initialize\n", errCount)
 	}
 
 	// Set synchronized start time for all publishers
