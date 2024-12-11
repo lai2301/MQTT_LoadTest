@@ -22,6 +22,7 @@ type Client struct {
 	messagesChan chan []byte
 	topic        string
 	clientIndex  int
+	startTime    time.Time
 }
 
 type Stats struct {
@@ -76,7 +77,12 @@ func (s *Stats) UpdateChannelRate(channelID int, rate float64) {
 }
 
 func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client, error) {
-	clientID := fmt.Sprintf("%s%d", config.ClientPrefix, id)
+	// Use different prefixes for pub/sub but same ID for pairs
+	clientPrefix := "loadtest-pub-"
+	if isSubscriber {
+		clientPrefix = "loadtest-sub-"
+	}
+	clientID := fmt.Sprintf("%s%d", clientPrefix, id/2)
 	topic := fmt.Sprintf("%s%d", config.TopicPrefix, id/2)
 
 	opts := mqtt.NewClientOptions().
@@ -88,6 +94,8 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetAutoReconnect(true).
 		SetKeepAlive(30 * time.Second).
 		SetPingTimeout(10 * time.Second).
+		SetMaxReconnectInterval(5 * time.Second).
+		SetOrderMatters(false).
 		SetConnectionLostHandler(func(client mqtt.Client, err error) {
 			fmt.Printf("Connection lost for client %s: %v\n", clientID, err)
 		}).
@@ -135,6 +143,7 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		messagesChan: make(chan []byte, 100),
 		topic:        topic,
 		clientIndex:  id / 2,
+		startTime:    time.Time{},
 	}, nil
 }
 
@@ -144,6 +153,10 @@ func (c *Client) Start() {
 	} else {
 		go c.publishLoop()
 	}
+}
+
+func (c *Client) SetStartTime(t time.Time) {
+	c.startTime = t
 }
 
 func (c *Client) subscribeLoop() {
@@ -180,7 +193,10 @@ func (c *Client) subscribeLoop() {
 }
 
 func (c *Client) publishLoop() {
-	// Use time.Ticker for more precise timing
+	if !c.startTime.IsZero() {
+		time.Sleep(time.Until(c.startTime))
+	}
+
 	publishInterval := time.Second / time.Duration(c.config.PublishRate)
 	ticker := time.NewTicker(publishInterval)
 	defer ticker.Stop()
@@ -188,6 +204,10 @@ func (c *Client) publishLoop() {
 	payload := make([]byte, c.config.MessageSize)
 	lastCount := uint64(0)
 	lastTime := time.Now()
+
+	// Pre-generate some random data
+	randomData := make([]byte, c.config.MessageSize*10)
+	_, _ = rand.Read(randomData)
 
 	for {
 		select {
@@ -207,31 +227,29 @@ func (c *Client) publishLoop() {
 
 			// Generate message with timestamp
 			timestamp := time.Now().UnixNano()
-			timestampStr := fmt.Sprintf("%d", timestamp)
-			copy(payload[0:8], []byte(timestampStr))
+			copy(payload[0:8], []byte(fmt.Sprintf("%d", timestamp)))
 			
+			// Use pre-generated random data
 			if len(payload) > 8 {
-				if _, err := rand.Read(payload[8:]); err != nil {
+				copy(payload[8:], randomData[:len(payload)-8])
+			}
+
+			// Publish without waiting for completion
+			token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
+			go func() {
+				if token.Wait() && token.Error() != nil {
 					c.stats.mutex.Lock()
 					c.stats.Errors++
 					c.stats.mutex.Unlock()
-					continue
+					fmt.Printf("Error publishing to topic %s: %v\n", c.topic, token.Error())
+					return
 				}
-			}
 
-			token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
-			if token.Wait() && token.Error() != nil {
 				c.stats.mutex.Lock()
-				c.stats.Errors++
+				c.stats.PublishedMessages++
+				c.stats.LastPublished[c.clientIndex] = time.Now()
 				c.stats.mutex.Unlock()
-				fmt.Printf("Error publishing to topic %s: %v\n", c.topic, token.Error())
-				continue
-			}
-
-			c.stats.mutex.Lock()
-			c.stats.PublishedMessages++
-			c.stats.LastPublished[c.clientIndex] = time.Now()
-			c.stats.mutex.Unlock()
+			}()
 		}
 	}
 }

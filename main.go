@@ -69,6 +69,14 @@ func main() {
 		}(client)
 	}
 
+	// Set synchronized start time for all publishers
+	publishStartTime := time.Now().Add(time.Second)
+	for _, pub := range publishers {
+		if pub != nil {
+			pub.SetStartTime(publishStartTime)
+		}
+	}
+
 	// Wait a moment for all clients to be ready
 	time.Sleep(time.Second)
 	
