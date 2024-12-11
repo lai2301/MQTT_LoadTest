@@ -182,10 +182,15 @@ cleanup:
 	fmt.Printf("Total Publishers: %d\n", config.NumClients)
 	fmt.Printf("Total Subscribers: %d\n", config.SubClients)
 	fmt.Printf("Test Duration: %.2f seconds\n", elapsed)
+	
+	fmt.Printf("\n=== Message Statistics ===\n")
 	fmt.Printf("Total Messages Published: %d\n", stats.PublishedMessages)
 	fmt.Printf("Total Messages Received: %d\n", stats.ReceivedMessages)
-	fmt.Printf("Message Loss: %.2f%%\n",
-		100-float64(stats.ReceivedMessages)/float64(stats.PublishedMessages)*100)
+	lossCount := stats.PublishedMessages - stats.ReceivedMessages
+	lossRate := 100 - float64(stats.ReceivedMessages)/float64(stats.PublishedMessages)*100
+	fmt.Printf("Messages Lost: %d (%.2f%%)\n", lossCount, lossRate)
+	
+	fmt.Printf("\n=== Performance Metrics ===\n")
 	fmt.Printf("Average Publishing Rate: %.2f msg/sec\n",
 		float64(stats.PublishedMessages)/elapsed)
 	fmt.Printf("Average Receiving Rate: %.2f msg/sec\n",
@@ -194,5 +199,16 @@ cleanup:
 		float64(stats.PublishedMessages)/(elapsed*float64(config.NumClients)))
 	fmt.Printf("Average Receiving Rate Per Channel: %.2f msg/sec\n",
 		float64(stats.ReceivedMessages)/(elapsed*float64(config.SubClients)))
+	
+	fmt.Printf("\n=== Error Statistics ===\n")
 	fmt.Printf("Total Errors: %d\n", stats.Errors)
+	fmt.Printf("Retry Attempts: %d\n", stats.RetryAttempts)
+	fmt.Printf("Successful Retries: %d\n", stats.RetrySuccesses)
+	fmt.Printf("Timeout Errors: %d\n", stats.TimeoutErrors)
+	fmt.Printf("Connection Errors: %d\n", stats.ConnectionErrors)
+	
+	if stats.RetryAttempts > 0 {
+		fmt.Printf("Retry Success Rate: %.2f%%\n", 
+			float64(stats.RetrySuccesses)/float64(stats.RetryAttempts)*100)
+	}
 }

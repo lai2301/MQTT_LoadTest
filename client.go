@@ -29,8 +29,12 @@ type Stats struct {
 	PublishedMessages uint64
 	ReceivedMessages  uint64
 	Errors            uint64
-	LastPublished     map[int]time.Time // Track last publish time per client
-	LastReceived      map[int]time.Time // Track last receive time per client
+	RetryAttempts     uint64    // Track total retry attempts
+	RetrySuccesses    uint64    // Track successful retries
+	TimeoutErrors     uint64    // Track timeout errors
+	ConnectionErrors  uint64    // Track connection-related errors
+	LastPublished     map[int]time.Time
+	LastReceived      map[int]time.Time
 	ChannelStats      map[int]*ChannelStat
 	mutex             sync.Mutex
 }
@@ -49,6 +53,8 @@ type ClientOptions struct {
 	BatchSize       int
 	PublishTimeout  time.Duration
 	ConnectTimeout  time.Duration
+	MaxRetries      int
+	RetryDelay     time.Duration
 }
 
 func DefaultClientOptions() ClientOptions {
@@ -57,6 +63,8 @@ func DefaultClientOptions() ClientOptions {
 		BatchSize:       10,
 		PublishTimeout:  5 * time.Second,
 		ConnectTimeout:  10 * time.Second,
+		MaxRetries:      3,
+		RetryDelay:     100 * time.Millisecond,
 	}
 }
 
@@ -212,6 +220,49 @@ func (c *Client) subscribeLoop() {
 	}
 }
 
+func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay time.Duration) error {
+	var lastErr error
+	for i := 0; i <= maxRetries; i++ {
+		token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
+		if token.WaitTimeout(5 * time.Second) {
+			if token.Error() == nil {
+				c.stats.mutex.Lock()
+				c.stats.PublishedMessages++
+				if i > 0 {
+					c.stats.RetrySuccesses++
+				}
+				c.stats.LastPublished[c.clientIndex] = time.Now()
+				c.stats.mutex.Unlock()
+				return nil
+			}
+			lastErr = token.Error()
+			if strings.Contains(lastErr.Error(), "timeout") {
+				c.stats.mutex.Lock()
+				c.stats.TimeoutErrors++
+				c.stats.mutex.Unlock()
+			} else {
+				c.stats.mutex.Lock()
+				c.stats.ConnectionErrors++
+				c.stats.mutex.Unlock()
+			}
+		} else {
+			lastErr = fmt.Errorf("publish timeout")
+			c.stats.mutex.Lock()
+			c.stats.TimeoutErrors++
+			c.stats.mutex.Unlock()
+		}
+
+		if i < maxRetries {
+			c.stats.mutex.Lock()
+			c.stats.RetryAttempts++
+			c.stats.mutex.Unlock()
+			time.Sleep(retryDelay)
+			fmt.Printf("Retrying publish for client %s (attempt %d/%d)\n", c.ID, i+2, maxRetries+1)
+		}
+	}
+	return lastErr
+}
+
 func (c *Client) publishLoop() {
 	if !c.startTime.IsZero() {
 		time.Sleep(time.Until(c.startTime))
@@ -233,32 +284,33 @@ func (c *Client) publishLoop() {
 		_, _ = rand.Read(payloadPool[i][8:]) // Leave space for timestamp
 	}
 
-	// Create a buffered channel for publish tokens
-	tokenChan := make(chan mqtt.Token, 100)
+	// Create a buffered channel for publish operations
+	publishChan := make(chan []byte, 100)
 	
-	// Start a goroutine to handle publish completions
-	go func() {
-		for token := range tokenChan {
-			if token.Wait() && token.Error() != nil {
-				c.stats.mutex.Lock()
-				c.stats.Errors++
-				c.stats.mutex.Unlock()
-				fmt.Printf("Error publishing to topic %s: %v\n", c.topic, token.Error())
-				continue
+	// Start publisher goroutines
+	const numPublishers = 3  // Number of concurrent publishers
+	var publishWg sync.WaitGroup
+	for i := 0; i < numPublishers; i++ {
+		publishWg.Add(1)
+		go func() {
+			defer publishWg.Done()
+			for payload := range publishChan {
+				if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay); err != nil {
+					c.stats.mutex.Lock()
+					c.stats.Errors++
+					c.stats.mutex.Unlock()
+					fmt.Printf("Final publish error for client %s: %v\n", c.ID, err)
+				}
 			}
-
-			c.stats.mutex.Lock()
-			c.stats.PublishedMessages++
-			c.stats.LastPublished[c.clientIndex] = time.Now()
-			c.stats.mutex.Unlock()
-		}
-	}()
+		}()
+	}
 
 	payloadIndex := 0
 	for {
 		select {
 		case <-c.stopChan:
-			close(tokenChan)
+			close(publishChan)
+			publishWg.Wait()
 			return
 		case <-ticker.C:
 			// Update stats every second
@@ -272,25 +324,21 @@ func (c *Client) publishLoop() {
 					lastTime = time.Now()
 			}
 
-			// Use pre-generated payload
+			// Prepare payload
 			copy(payload, payloadPool[payloadIndex])
 			payloadIndex = (payloadIndex + 1) % len(payloadPool)
-
-			// Update timestamp
 			timestamp := time.Now().UnixNano()
 			copy(payload[0:8], []byte(fmt.Sprintf("%d", timestamp)))
 
-			// Publish without blocking
-			token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
+			// Send to publish channel
 			select {
-			case tokenChan <- token:
+			case publishChan <- append([]byte(nil), payload...):
+				// Payload queued successfully
 			default:
-				// If channel is full, handle completion here
-				if token.Wait() && token.Error() != nil {
-					c.stats.mutex.Lock()
-					c.stats.Errors++
-					c.stats.mutex.Unlock()
-				}
+				// Channel full, count as error
+				c.stats.mutex.Lock()
+				c.stats.Errors++
+				c.stats.mutex.Unlock()
 			}
 		}
 	}
