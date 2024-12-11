@@ -33,9 +33,14 @@ type Stats struct {
 	RetrySuccesses    uint64    // Track successful retries
 	TimeoutErrors     uint64    // Track timeout errors
 	ConnectionErrors  uint64    // Track connection-related errors
+	DroppedMessages  uint64    // Track messages dropped by subscriber
+	DuplicateMessages uint64   // Track duplicate messages
+	OutOfOrderMessages uint64  // Track out-of-order messages
+	ProcessingErrors uint64    // Track message processing errors
 	LastPublished     map[int]time.Time
 	LastReceived      map[int]time.Time
 	ChannelStats      map[int]*ChannelStat
+	LastMessageID    map[int]uint64  // Track last message ID per channel
 	mutex             sync.Mutex
 }
 
@@ -73,6 +78,7 @@ func NewStats() *Stats {
 		LastPublished: make(map[int]time.Time),
 		LastReceived:  make(map[int]time.Time),
 		ChannelStats:  make(map[int]*ChannelStat),
+		LastMessageID: make(map[int]uint64),
 	}
 }
 
@@ -126,9 +132,6 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		}).
 		SetConnectionLostHandler(func(client mqtt.Client, err error) {
 			fmt.Printf("Connection lost for client %s: %v\n", clientID, err)
-			// Try to reconnect immediately
-			time.Sleep(100 * time.Millisecond)
-			client.Connect()
 		})
 
 	// Configure TLS if using SSL
@@ -188,19 +191,27 @@ func (c *Client) SetStartTime(t time.Time) {
 }
 
 func (c *Client) subscribeLoop() {
-	// Add subscription with callback to confirm subscription
-	token := c.client.Subscribe(c.topic, byte(c.config.QoS), func(client mqtt.Client, msg mqtt.Message) {
-		c.stats.mutex.Lock()
-		c.stats.ReceivedMessages++
-		c.stats.LastReceived[c.clientIndex] = time.Now()
-		c.stats.mutex.Unlock()
-
-		// Extract timestamp from payload for latency calculation
-		if len(msg.Payload()) >= 8 {
-			sentTime := string(msg.Payload()[:8])
-			if timestamp, err := strconv.ParseInt(sentTime, 10, 64); err == nil {
-				_ = time.Since(time.Unix(0, timestamp))
+	// Create message processing channel with large buffer
+	msgChan := make(chan mqtt.Message, 1000)
+	
+	// Start multiple message processors
+	const numProcessors = 5
+	for i := 0; i < numProcessors; i++ {
+		go func() {
+			for msg := range msgChan {
+				c.processMessage(msg)
 			}
+		}()
+	}
+
+	token := c.client.Subscribe(c.topic, byte(c.config.QoS), func(client mqtt.Client, msg mqtt.Message) {
+		select {
+		case msgChan <- msg:
+			// Message queued for processing
+		default:
+			c.stats.mutex.Lock()
+			c.stats.DroppedMessages++
+			c.stats.mutex.Unlock()
 		}
 	})
 
@@ -218,6 +229,36 @@ func (c *Client) subscribeLoop() {
 	if token := c.client.Unsubscribe(c.topic); token.Wait() && token.Error() != nil {
 		fmt.Printf("Error unsubscribing from topic %s: %v\n", c.topic, token.Error())
 	}
+}
+
+func (c *Client) processMessage(msg mqtt.Message) {
+	if len(msg.Payload()) < 16 {
+		c.stats.mutex.Lock()
+		c.stats.ProcessingErrors++
+		c.stats.mutex.Unlock()
+		return
+	}
+
+	c.stats.mutex.Lock()
+	defer c.stats.mutex.Unlock()
+
+	msgID, err := strconv.ParseUint(string(msg.Payload()[8:16]), 10, 64)
+	if err == nil {
+		lastID, exists := c.stats.LastMessageID[c.clientIndex]
+		if exists {
+			if msgID <= lastID {
+				c.stats.DuplicateMessages++
+				return
+			} else if msgID > lastID+1 {
+				c.stats.OutOfOrderMessages++
+				c.stats.DroppedMessages += msgID - lastID - 1
+			}
+		}
+		c.stats.LastMessageID[c.clientIndex] = msgID
+	}
+
+	c.stats.ReceivedMessages++
+	c.stats.LastReceived[c.clientIndex] = time.Now()
 }
 
 func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay time.Duration) error {
@@ -268,28 +309,26 @@ func (c *Client) publishLoop() {
 		time.Sleep(time.Until(c.startTime))
 	}
 
-	// Use smaller intervals for more frequent publishing
 	publishInterval := time.Second / time.Duration(c.config.PublishRate)
 	ticker := time.NewTicker(publishInterval)
 	defer ticker.Stop()
 
-	payload := make([]byte, c.config.MessageSize)
-	lastCount := uint64(0)
-	lastTime := time.Now()
-
-	// Pre-generate multiple random payloads
-	payloadPool := make([][]byte, 10)
+	// Pre-allocate payloads
+	const poolSize = 1000
+	payloadPool := make([][]byte, poolSize)
 	for i := range payloadPool {
 		payloadPool[i] = make([]byte, c.config.MessageSize)
-		_, _ = rand.Read(payloadPool[i][8:]) // Leave space for timestamp
+		_, _ = rand.Read(payloadPool[i][16:]) // Leave space for timestamp and msgID
 	}
 
-	// Create a buffered channel for publish operations
-	publishChan := make(chan []byte, 100)
+	// Larger buffer for publish channel
+	publishChan := make(chan []byte, poolSize)
 	
-	// Start publisher goroutines
-	const numPublishers = 3  // Number of concurrent publishers
+	// More concurrent publishers
+	const numPublishers = 5
 	var publishWg sync.WaitGroup
+	
+	// Start multiple publisher goroutines
 	for i := 0; i < numPublishers; i++ {
 		publishWg.Add(1)
 		go func() {
@@ -299,13 +338,20 @@ func (c *Client) publishLoop() {
 					c.stats.mutex.Lock()
 					c.stats.Errors++
 					c.stats.mutex.Unlock()
-					fmt.Printf("Final publish error for client %s: %v\n", c.ID, err)
 				}
 			}
 		}()
 	}
 
+	messageID := uint64(0)
 	payloadIndex := 0
+	lastCount := uint64(0)
+	lastTime := time.Now()
+	
+	// Create batch of messages
+	const batchSize = 10
+	batch := make([][]byte, 0, batchSize)
+
 	for {
 		select {
 		case <-c.stopChan:
@@ -317,28 +363,38 @@ func (c *Client) publishLoop() {
 			if time.Since(lastTime) >= time.Second {
 				c.stats.mutex.Lock()
 				currentCount := c.stats.PublishedMessages
-					rate := float64(currentCount-lastCount) / time.Since(lastTime).Seconds()
-					c.stats.UpdateChannelRate(c.clientIndex, rate)
-					lastCount = currentCount
-					c.stats.mutex.Unlock()
-					lastTime = time.Now()
+				rate := float64(currentCount-lastCount) / time.Since(lastTime).Seconds()
+				c.stats.UpdateChannelRate(c.clientIndex, rate)
+				lastCount = currentCount
+				c.stats.mutex.Unlock()
+				lastTime = time.Now()
 			}
 
-			// Prepare payload
-			copy(payload, payloadPool[payloadIndex])
-			payloadIndex = (payloadIndex + 1) % len(payloadPool)
-			timestamp := time.Now().UnixNano()
-			copy(payload[0:8], []byte(fmt.Sprintf("%d", timestamp)))
+			// Prepare batch of messages
+			batch = batch[:0]
+			for i := 0; i < batchSize; i++ {
+				messageID++
+				payload := payloadPool[payloadIndex]
+				payloadIndex = (payloadIndex + 1) % len(payloadPool)
 
-			// Send to publish channel
-			select {
-			case publishChan <- append([]byte(nil), payload...):
-				// Payload queued successfully
-			default:
-				// Channel full, count as error
-				c.stats.mutex.Lock()
-				c.stats.Errors++
-				c.stats.mutex.Unlock()
+				// Update timestamp and message ID
+				timestamp := time.Now().UnixNano()
+				copy(payload[0:8], []byte(fmt.Sprintf("%08d", timestamp)))
+				copy(payload[8:16], []byte(fmt.Sprintf("%08d", messageID)))
+
+				batch = append(batch, append([]byte(nil), payload...))
+			}
+
+			// Send batch to publishers
+			for _, msg := range batch {
+				select {
+				case publishChan <- msg:
+					// Message queued successfully
+				default:
+					c.stats.mutex.Lock()
+					c.stats.DroppedMessages++
+					c.stats.mutex.Unlock()
+				}
 			}
 		}
 	}

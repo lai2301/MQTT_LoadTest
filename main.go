@@ -189,6 +189,10 @@ cleanup:
 	lossCount := stats.PublishedMessages - stats.ReceivedMessages
 	lossRate := 100 - float64(stats.ReceivedMessages)/float64(stats.PublishedMessages)*100
 	fmt.Printf("Messages Lost: %d (%.2f%%)\n", lossCount, lossRate)
+	fmt.Printf("Dropped Messages: %d\n", stats.DroppedMessages)
+	fmt.Printf("Duplicate Messages: %d\n", stats.DuplicateMessages)
+	fmt.Printf("Out of Order Messages: %d\n", stats.OutOfOrderMessages)
+	fmt.Printf("Processing Errors: %d\n", stats.ProcessingErrors)
 	
 	fmt.Printf("\n=== Performance Metrics ===\n")
 	fmt.Printf("Average Publishing Rate: %.2f msg/sec\n",
