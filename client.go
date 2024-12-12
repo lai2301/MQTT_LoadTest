@@ -34,6 +34,7 @@ type Stats struct {
 	RetrySuccesses    uint64    // Track successful retries
 	TimeoutErrors     uint64    // Track timeout errors
 	ConnectionErrors  uint64    // Track connection-related errors
+	ReconnectCount   uint64    // Track number of reconnections
 	DroppedMessages  uint64    // Track messages dropped by subscriber
 	DuplicateMessages uint64   // Track duplicate messages
 	OutOfOrderMessages uint64  // Track out-of-order messages
@@ -268,6 +269,10 @@ func (c *Client) subscribeLoop() {
 		case <-reconnectTicker.C:
 			if !c.client.IsConnected() {
 				fmt.Printf("Client %s disconnected, attempting to reconnect...\n", c.ID)
+				c.stats.mutex.Lock()
+				c.stats.ReconnectCount++
+				c.stats.mutex.Unlock()
+				
 				if token := c.client.Connect(); token.Wait() && token.Error() != nil {
 					fmt.Printf("Reconnection failed for %s: %v\n", c.ID, token.Error())
 					continue
@@ -363,6 +368,15 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 		if token.WaitTimeout(5 * time.Second) {
 			if err := token.Error(); err != nil {
 				lastErr = err
+				c.stats.mutex.Lock()
+				c.stats.Errors++
+				if strings.Contains(err.Error(), "timeout") {
+					c.stats.TimeoutErrors++
+				} else {
+					c.stats.ConnectionErrors++
+				}
+				c.stats.mutex.Unlock()
+				
 				if i == maxRetries {
 					fmt.Printf("Client %s - Final publish attempt failed: %v\n", c.ID, err)
 				}
@@ -378,26 +392,21 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 			}
 		} else {
 			lastErr = fmt.Errorf("publish timeout")
+			c.stats.mutex.Lock()
+			c.stats.TimeoutErrors++
+			c.stats.Errors++
+			c.stats.mutex.Unlock()
+			
 			if i == maxRetries {
 				fmt.Printf("Client %s - Final publish attempt timed out\n", c.ID)
 			}
-		}
-
-		// Update error statistics
-		if strings.Contains(lastErr.Error(), "timeout") {
-			c.stats.mutex.Lock()
-			c.stats.TimeoutErrors++
-			c.stats.mutex.Unlock()
-		} else {
-			c.stats.mutex.Lock()
-			c.stats.ConnectionErrors++
-			c.stats.mutex.Unlock()
 		}
 
 		if i < maxRetries {
 			c.stats.mutex.Lock()
 			c.stats.RetryAttempts++
 			c.stats.mutex.Unlock()
+			
 			time.Sleep(retryDelay)
 		}
 	}
