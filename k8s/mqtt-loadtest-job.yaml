@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mqtt-loadtest
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - name: mqtt-loadtest
+        image: lai2301/mqtt-load-tester:latest
+        args:
+        - --broker=ssl://mqtt-broker:1883
+        - --mode=pairwise
+        - --clients=10
+        - --duration=60
+        - --rate=100
+        - --qos=1
+        - --username=$(MQTT_USERNAME)
+        - --password=$(MQTT_PASSWORD)
+        env:
+        - name: MQTT_USERNAME
+          valueFrom:
+            secretRef:
+              name: mqtt-credentials
+              key: username
+        - name: MQTT_PASSWORD
+          valueFrom:
+            secretRef:
+              name: mqtt-credentials
+              key: password
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+      restartPolicy: Never 
