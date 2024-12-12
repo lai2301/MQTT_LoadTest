@@ -108,42 +108,36 @@ func (s *Stats) UpdateChannelRate(channelID int, rate float64) {
 }
 
 func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client, error) {
-	// Use different prefixes for pub/sub but same ID for pairs
-	clientPrefix := "loadtest-pub-"
-	if isSubscriber {
-		clientPrefix = "loadtest-sub-"
-	}
-	clientID := fmt.Sprintf("%s%d", clientPrefix, id/2)
-	topic := fmt.Sprintf("%s%d", config.TopicPrefix, id/2)
+	clientID := generateClientID(id, config.TestMode, isSubscriber)
+	topic := generateTopic(id, config.TestMode, config.TopicPrefix, isSubscriber)
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(config.BrokerURL).
 		SetClientID(clientID).
 		SetUsername(config.Username).
 		SetPassword(config.Password).
-		SetCleanSession(false).
-		SetAutoReconnect(true).
+		SetCleanSession(config.CleanSession).
+		SetAutoReconnect(config.AutoReconnect).
 		SetKeepAlive(30 * time.Second).
 		SetPingTimeout(10 * time.Second).
-		SetMaxReconnectInterval(1 * time.Second).
-		SetOrderMatters(false).
 		SetConnectTimeout(10 * time.Second).
 		SetWriteTimeout(5 * time.Second).
-		SetMessageChannelDepth(1000).
-		SetResumeSubs(true).
-		SetConnectRetry(true).
-		SetMaxReconnectInterval(time.Second).
-		SetAutoReconnect(true).
-		SetCleanSession(true).
+		SetMaxReconnectInterval(1 *time.Second).
 		SetConnectRetryInterval(time.Second).
+		SetConnectRetry(true).
+		SetResumeSubs(config.ResumeSubs).
+		SetOrderMatters(config.OrderMatters).
+		SetMessageChannelDepth(config.MessageChannelDepth).
 		SetStore(mqtt.NewMemoryStore()).
 		SetOnConnectHandler(func(client mqtt.Client) {
 			fmt.Printf("Client %s connected successfully at %v\n", 
 				clientID, time.Now().Format("15:04:05.000"))
 		}).
 		SetConnectionLostHandler(func(client mqtt.Client, err error) {
-			fmt.Printf("Connection lost for client %s at %v: %v\n", 
-				clientID, time.Now().Format("15:04:05.000"), err)
+			if !strings.Contains(err.Error(), "EOF") {
+				fmt.Printf("Connection lost for client %s at %v: %v\n", 
+					clientID, time.Now().Format("15:04:05.000"), err)
+			}
 			stats.mutex.Lock()
 			stats.ConnectionErrors++
 			stats.mutex.Unlock()
@@ -156,7 +150,10 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 	// Configure TLS if using SSL
 	if strings.HasPrefix(config.BrokerURL, "ssl://") {
 		tlsConfig := &tls.Config{
-			InsecureSkipVerify: true,  // Note: In production, you should properly verify certificates
+			InsecureSkipVerify: config.InsecureSkipVerify,
+			MinVersion:       tls.VersionTLS12,
+			MaxVersion:       tls.VersionTLS13,
+			Renegotiation:    tls.RenegotiateNever,
 		}
 		opts.SetTLSConfig(tlsConfig)
 	}
@@ -192,7 +189,7 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		isSubscriber: isSubscriber,
 		messagesChan: make(chan []byte, 100),
 		topic:        topic,
-		clientIndex:  id / 2,
+		clientIndex:  id,
 		startTime:    time.Time{},
 		TestDuration: config.TestDuration,
 	}, nil
@@ -298,7 +295,43 @@ func (c *Client) processMessage(msg mqtt.Message) {
 	defer c.stats.mutex.Unlock()
 
 	msgID, err := strconv.ParseUint(string(msg.Payload()[8:16]), 10, 64)
-	if err == nil {
+	if err != nil {
+		c.stats.ProcessingErrors++
+		return
+	}
+
+	switch c.config.TestMode {
+	case ModeNToOne:
+		// In N-to-1 mode, don't check for duplicates
+		c.stats.ReceivedMessages++
+		c.stats.LastReceived[c.clientIndex] = time.Now()
+		
+	case ModeManyToMany:
+		// Extract publisher ID from topic
+		parts := strings.Split(msg.Topic(), "/")
+		if len(parts) < 1 {
+			c.stats.ProcessingErrors++
+			return
+		}
+		pubID, err := strconv.Atoi(parts[len(parts)-1])
+		if err != nil {
+			c.stats.ProcessingErrors++
+			return
+		}
+
+		// Track last message ID per publisher
+		lastID, exists := c.stats.LastMessageID[pubID]
+		if exists && msgID <= lastID {
+			// Skip duplicate messages from same publisher
+			return
+		}
+		
+		c.stats.LastMessageID[pubID] = msgID
+		c.stats.ReceivedMessages++
+		c.stats.LastReceived[c.clientIndex] = time.Now()
+		
+	default:
+		// For other modes, check for duplicates and order
 		lastID, exists := c.stats.LastMessageID[c.clientIndex]
 		if exists {
 			if msgID <= lastID {
@@ -310,10 +343,9 @@ func (c *Client) processMessage(msg mqtt.Message) {
 			}
 		}
 		c.stats.LastMessageID[c.clientIndex] = msgID
+		c.stats.ReceivedMessages++
+		c.stats.LastReceived[c.clientIndex] = time.Now()
 	}
-
-	c.stats.ReceivedMessages++
-	c.stats.LastReceived[c.clientIndex] = time.Now()
 }
 
 func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay time.Duration) error {
@@ -323,6 +355,7 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 		c.stats.mutex.Unlock()
 		return fmt.Errorf("client not connected")
 	}
+
 	var lastErr error
 	for i := 0; i <= maxRetries; i++ {
 		token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
@@ -389,6 +422,16 @@ func (c *Client) publishLoop() {
 	startTime := time.Now()
 	publishInterval := time.Second / time.Duration(c.config.PublishRate)
 
+	// For OneToN mode, create a list of subscriber topics
+	var topics []string
+	if c.config.TestMode == ModeOneToN {
+		for i := 0; i < c.config.SubClients; i++ {
+			topics = append(topics, fmt.Sprintf("%s%d", c.config.TopicPrefix, i))
+		}
+	} else {
+		topics = []string{c.topic}
+	}
+
 	fmt.Printf("Client %s - Starting publisher (rate: %d msg/sec, interval: %v)\n", 
 		c.ID, c.config.PublishRate, publishInterval)
 
@@ -413,11 +456,14 @@ func (c *Client) publishLoop() {
 		copy(payload[0:8], []byte(fmt.Sprintf("%08d", timestamp)))
 		copy(payload[8:16], []byte(fmt.Sprintf("%08d", messageID)))
 
-		if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay); err != nil {
-			c.stats.mutex.Lock()
-			c.stats.Errors++
-			c.stats.mutex.Unlock()
-			fmt.Printf("Client %s - Publish error: %v\n", c.ID, err)
+		// Publish to all topics for OneToN mode
+		for _, topic := range topics {
+			if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay); err != nil {
+				c.stats.mutex.Lock()
+				c.stats.Errors++
+				c.stats.mutex.Unlock()
+				fmt.Printf("Client %s - Publish error to topic %s: %v\n", c.ID, topic, err)
+			}
 		}
 
 		time.Sleep(publishInterval)
@@ -441,4 +487,34 @@ func (c *Client) Stop() {
 
 	// Disconnect with a longer quiesce time
 	c.client.Disconnect(1000) // 1 second to complete pending work
+}
+
+func generateTopic(id int, mode TestMode, prefix string, isSubscriber bool) string {
+	switch mode {
+	case ModePairwise:
+		return fmt.Sprintf("%s%d", prefix, id)
+	case ModeNToOne:
+		return fmt.Sprintf("%sntone", prefix)
+	case ModeOneToN:
+		if isSubscriber {
+			return fmt.Sprintf("%s%d", prefix, id)
+		}
+		// Publisher will use individual topics in publishLoop
+		return prefix
+	case ModeManyToMany:
+		if isSubscriber {
+			return fmt.Sprintf("%s#", prefix)
+		}
+		return fmt.Sprintf("%s%d", prefix, id)
+	default:
+		return fmt.Sprintf("%s%d", prefix, id)
+	}
+}
+
+func generateClientID(id int, mode TestMode, isSubscriber bool) string {
+	prefix := "loadtest-pub-"
+	if isSubscriber {
+		prefix = "loadtest-sub-"
+	}
+	return fmt.Sprintf("%s%d", prefix, id)
 }
