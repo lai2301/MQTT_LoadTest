@@ -140,24 +140,21 @@ func main() {
 	defer ticker.Stop()
 
 	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				elapsed := time.Since(startTime).Seconds()
-				_ = bar.Set(int(elapsed))
+		for range ticker.C {
+			elapsed := time.Since(startTime).Seconds()
+			_ = bar.Set(int(elapsed))
 
-				if int(elapsed) >= config.TestDuration {
-					close(done)
-					return
-				}
+			if int(elapsed) >= config.TestDuration {
+				close(done)
+				return
+			}
 
-				// Print statistics every 5 seconds
-				if int(elapsed)%5 == 0 {
-					fmt.Printf("\n=== Test Statistics (%.1f seconds elapsed) ===\n", elapsed)
-					fmt.Printf("Messages: Pub=%d, Sub=%d, Rate=%.2f msg/sec, Errors=%d\n",
-						stats.PublishedMessages, stats.ReceivedMessages,
-						float64(stats.PublishedMessages)/elapsed, stats.Errors)
-				}
+			// Print statistics every 5 seconds
+			if int(elapsed)%5 == 0 {
+				fmt.Printf("\n=== Test Statistics (%.1f seconds elapsed) ===\n", elapsed)
+				fmt.Printf("Messages: Pub=%d, Sub=%d, Rate=%.2f msg/sec, Errors=%d\n",
+					stats.PublishedMessages, stats.ReceivedMessages,
+					float64(stats.PublishedMessages)/elapsed, stats.Errors)
 			}
 		}
 	}()
@@ -218,6 +215,7 @@ func printFinalStats(stats *Stats, config *Config, elapsed float64) {
     fmt.Printf("\n=== Final Test Results ===\n")
     fmt.Printf("Total Publishers: %d\n", config.NumClients)
     fmt.Printf("Total Subscribers: %d\n", config.SubClients)
+	fmt.Printf("Message Rate Per Client: %d\n", config.PublishRate)
     fmt.Printf("Test Duration: %.2f seconds\n", elapsed)
     
     fmt.Printf("\n=== Message Statistics ===\n")
