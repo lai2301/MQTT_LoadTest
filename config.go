@@ -51,7 +51,7 @@ func LoadConfig() *Config {
 	mode := pflag.String("mode", "pairwise", "Test mode (pairwise, ntone, oton, mtom)")
 
 	// MQTT Client Options
-	cleanSession := pflag.Bool("clean-session", false, "Clean session on connect")
+	cleanSession := pflag.Bool("clean-session", true, "Clean session on connect")
 	autoReconnect := pflag.Bool("auto-reconnect", true, "Auto reconnect on connection loss")
 	resumeSubs := pflag.Bool("resume-subs", true, "Resume subscriptions after reconnect")
 	orderMatters := pflag.Bool("order-matters", false, "Maintain message order")

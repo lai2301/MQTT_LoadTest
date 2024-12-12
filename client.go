@@ -122,8 +122,9 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetPingTimeout(10 * time.Second).
 		SetConnectTimeout(10 * time.Second).
 		SetWriteTimeout(5 * time.Second).
-		SetMaxReconnectInterval(time.Second).
+		SetMaxReconnectInterval(1 *time.Second).
 		SetConnectRetryInterval(time.Second).
+		SetConnectRetry(true).
 		SetResumeSubs(config.ResumeSubs).
 		SetOrderMatters(config.OrderMatters).
 		SetMessageChannelDepth(config.MessageChannelDepth).
@@ -140,6 +141,10 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 			stats.mutex.Lock()
 			stats.ConnectionErrors++
 			stats.mutex.Unlock()
+		}).
+		SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
+			fmt.Printf("Client %s attempting to reconnect at %v\n", 
+				clientID, time.Now().Format("15:04:05.000"))
 		})
 
 	// Configure TLS if using SSL
@@ -343,7 +348,7 @@ func (c *Client) processMessage(msg mqtt.Message) {
 	}
 }
 
-func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay time.Duration, topic string) error {
+func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay time.Duration) error {
 	if !c.client.IsConnected() {
 		c.stats.mutex.Lock()
 		c.stats.ConnectionErrors++
@@ -353,7 +358,7 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 
 	var lastErr error
 	for i := 0; i <= maxRetries; i++ {
-		token := c.client.Publish(topic, byte(c.config.QoS), c.config.RetainMessage, payload)
+		token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
 		
 		if token.WaitTimeout(5 * time.Second) {
 			if err := token.Error(); err != nil {
@@ -453,7 +458,7 @@ func (c *Client) publishLoop() {
 
 		// Publish to all topics for OneToN mode
 		for _, topic := range topics {
-			if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay, topic); err != nil {
+			if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay); err != nil {
 				c.stats.mutex.Lock()
 				c.stats.Errors++
 				c.stats.mutex.Unlock()
