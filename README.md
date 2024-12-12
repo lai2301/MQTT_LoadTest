@@ -79,13 +79,28 @@ go build
 --insecure-skip-verify   Skip TLS certificate verification (default true)
 ```
 
-## Example Basic Test
+## Using Docker
 ```bash
 
-./mqtt-load-tester --broker tcp://localhost:1883 --mode pairwise --clients 5 --duration 60
-./mqtt-load-tester --broker ssl://localhost:1883 --mode ntone --clients 5 --sub-clients 1 --duration 60
-./mqtt-load-tester --broker tcp://localhost:1883 --mode oton --clients 1 --sub-clients 5 --duration 60
-./mqtt-load-tester --broker ssl://localhost:1883 --mode mtom --clients 10 --sub-clients 5 --duration 60
+docker build -t mqtt-load-tester .
+
+# Run pairwise test
+docker run mqtt-load-tester \
+    --broker ssl://your-broker:1883 \
+    --mode pairwise \
+    --clients 10 \
+    --duration 60
+
+# Run N-to-1 test with custom options
+docker run mqtt-load-tester \
+    --broker tcp://your-broker:1883 \
+    --mode ntone \
+    --clients 5 \
+    --sub-clients 1 \
+    --rate 100 \
+    --clean-session=false \
+    --auto-reconnect=true
+
 ```
 
 ## Example of Result
