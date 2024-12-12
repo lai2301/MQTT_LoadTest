@@ -262,6 +262,7 @@ func printFinalStats(stats *Stats, config *Config, elapsed float64) {
     fmt.Printf("Successful Retries: %d\n", stats.RetrySuccesses)
     fmt.Printf("Timeout Errors: %d\n", stats.TimeoutErrors)
     fmt.Printf("Connection Errors: %d\n", stats.ConnectionErrors)
+    fmt.Printf("Reconnection Count: %d\n", stats.ReconnectCount)
     
     if stats.RetryAttempts > 0 {
         fmt.Printf("Retry Success Rate: %.2f%%\n", 
