@@ -232,6 +232,7 @@ func printFinalStats(stats *Stats, config *Config, elapsed float64) {
     fmt.Printf("Total Publishers: %d\n", config.NumClients)
     fmt.Printf("Total Subscribers: %d\n", config.SubClients)
 	fmt.Printf("Message Rate Per Client: %d\n", config.PublishRate)
+	fmt.Printf("Testing Mode: %s\n", config.TestMode)
     fmt.Printf("Test Duration: %.2f seconds\n", elapsed)
     
     fmt.Printf("\n=== Message Statistics ===\n")

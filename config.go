@@ -26,6 +26,14 @@ type Config struct {
 	QoS           int
 	RetainMessage bool
 	TestMode      TestMode
+	
+	// MQTT Client Options
+	CleanSession        bool
+	AutoReconnect       bool
+	ResumeSubs         bool
+	OrderMatters       bool
+	MessageChannelDepth uint
+	InsecureSkipVerify bool
 }
 
 func LoadConfig() *Config {
@@ -35,12 +43,20 @@ func LoadConfig() *Config {
 	topicPrefix := pflag.String("topic", "loadtest/", "Topic prefix")
 	numClients := pflag.Int("clients", 1, "Number of publisher clients")
 	subClients := pflag.Int("sub-clients", 1, "Number of subscriber clients")
-	publishRate := pflag.Int("rate", 1, "Messages per second per publisher")
+	publishRate := pflag.Int("rate", 10, "Messages per second per publisher")
 	messageSize := pflag.Int("size", 100, "Message size in bytes")
 	testDuration := pflag.Int("duration", 30, "Test duration in seconds")
 	qos := pflag.Int("qos", 0, "MQTT QoS level (0, 1, or 2)")
 	retain := pflag.Bool("retain", false, "Retain messages")
 	mode := pflag.String("mode", "pairwise", "Test mode (pairwise, ntone, oton, mtom)")
+
+	// MQTT Client Options
+	cleanSession := pflag.Bool("clean-session", false, "Clean session on connect")
+	autoReconnect := pflag.Bool("auto-reconnect", true, "Auto reconnect on connection loss")
+	resumeSubs := pflag.Bool("resume-subs", true, "Resume subscriptions after reconnect")
+	orderMatters := pflag.Bool("order-matters", false, "Maintain message order")
+	msgChannelDepth := pflag.Uint("msg-channel-depth", 1000, "Message channel buffer size")
+	insecureSkipVerify := pflag.Bool("insecure-skip-verify", true, "Skip TLS certificate verification")
 
 	pflag.Parse()
 
@@ -57,5 +73,13 @@ func LoadConfig() *Config {
 		QoS:           *qos,
 		RetainMessage: *retain,
 		TestMode:      TestMode(*mode),
+		
+		// MQTT Client Options
+		CleanSession:        *cleanSession,
+		AutoReconnect:       *autoReconnect,
+		ResumeSubs:         *resumeSubs,
+		OrderMatters:       *orderMatters,
+		MessageChannelDepth: *msgChannelDepth,
+		InsecureSkipVerify: *insecureSkipVerify,
 	}
 }

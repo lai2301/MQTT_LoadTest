@@ -1,0 +1,42 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Log files
+*.log
+
+# Go workspace file
+go.work
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment variables
+.env
+
+# Build directory
+bin/
+dist/
+
+# Test coverage
+coverage.txt
+coverage.html
+
+# Debug files
+debug
+
+# Dependency directories (remove if you're committing vendor/)
+vendor/ 

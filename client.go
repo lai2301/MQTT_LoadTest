@@ -116,17 +116,17 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetClientID(clientID).
 		SetUsername(config.Username).
 		SetPassword(config.Password).
-		SetCleanSession(false).
-		SetAutoReconnect(true).
-		SetKeepAlive(60 * time.Second).
-		SetPingTimeout(20 * time.Second).
-		SetConnectTimeout(30 * time.Second).
-		SetWriteTimeout(10 * time.Second).
-		SetMaxReconnectInterval(5 * time.Second).
-		SetConnectRetryInterval(2 * time.Second).
-		SetResumeSubs(true).
-		SetOrderMatters(false).
-		SetMessageChannelDepth(1000).
+		SetCleanSession(config.CleanSession).
+		SetAutoReconnect(config.AutoReconnect).
+		SetKeepAlive(30 * time.Second).
+		SetPingTimeout(10 * time.Second).
+		SetConnectTimeout(10 * time.Second).
+		SetWriteTimeout(5 * time.Second).
+		SetMaxReconnectInterval(time.Second).
+		SetConnectRetryInterval(time.Second).
+		SetResumeSubs(config.ResumeSubs).
+		SetOrderMatters(config.OrderMatters).
+		SetMessageChannelDepth(config.MessageChannelDepth).
 		SetStore(mqtt.NewMemoryStore()).
 		SetOnConnectHandler(func(client mqtt.Client) {
 			fmt.Printf("Client %s connected successfully at %v\n", 
@@ -145,7 +145,7 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 	// Configure TLS if using SSL
 	if strings.HasPrefix(config.BrokerURL, "ssl://") {
 		tlsConfig := &tls.Config{
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: config.InsecureSkipVerify,
 			MinVersion:       tls.VersionTLS12,
 			MaxVersion:       tls.VersionTLS13,
 			Renegotiation:    tls.RenegotiateNever,
