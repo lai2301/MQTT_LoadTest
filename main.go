@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
@@ -127,97 +128,128 @@ func main() {
 	// Wait a moment for all clients to be ready
 	time.Sleep(time.Second)
 	
-	// Only start counting duration after all clients are initialized
-	startTime := time.Now()
-	lastStatsTime := time.Now()
-	statsInterval := time.Second * 5 // Print stats every 5 seconds
-
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	
+	// Create a done channel to signal completion
+	done := make(chan struct{})
 
-	// Start statistics reporting
+	startTime := time.Now()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			elapsed := time.Since(startTime).Seconds()
-			_ = bar.Set(int(elapsed))
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(startTime).Seconds()
+				_ = bar.Set(int(elapsed))
 
-			messageRate := float64(stats.PublishedMessages) / elapsed
+				if int(elapsed) >= config.TestDuration {
+					close(done)
+					return
+				}
 
-			// Print statistics every 5 seconds
-			if time.Since(lastStatsTime) >= statsInterval {
-				lastStatsTime = time.Now()
-				fmt.Printf("\n=== Test Statistics (%.1f seconds elapsed) ===\n", elapsed)
-				fmt.Printf("Messages: Pub=%d, Sub=%d, Rate=%.2f msg/sec, Errors=%d\n",
-					stats.PublishedMessages, stats.ReceivedMessages, messageRate, stats.Errors)
+				// Print statistics every 5 seconds
+				if int(elapsed)%5 == 0 {
+					fmt.Printf("\n=== Test Statistics (%.1f seconds elapsed) ===\n", elapsed)
+					fmt.Printf("Messages: Pub=%d, Sub=%d, Rate=%.2f msg/sec, Errors=%d\n",
+						stats.PublishedMessages, stats.ReceivedMessages,
+						float64(stats.PublishedMessages)/elapsed, stats.Errors)
+				}
 			}
+		}
+	}()
 
-			if int(elapsed) >= config.TestDuration {
-				goto cleanup
+	// Wait for either completion or interrupt
+	select {
+	case <-done:
+		fmt.Println("\nTest completed, shutting down...")
+	case <-sigChan:
+		fmt.Println("\nReceived interrupt signal, shutting down...")
+	}
+
+	// Stop all clients with a timeout
+	stopChan := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		
+		// Stop publishers first
+		for _, pub := range publishers {
+			if pub != nil {
+				wg.Add(1)
+				go func(c *Client) {
+					defer wg.Done()
+					c.Stop()
+				}(pub)
 			}
-
-		case <-sigChan:
-			fmt.Println("\nReceived interrupt signal, shutting down...")
-			goto cleanup
 		}
-	}
+		wg.Wait()
 
-cleanup:
-	// Stop all clients
-	for _, client := range publishers {
-		if client != nil {
-			client.Stop()
+		// Then stop subscribers
+		for _, sub := range subscribers {
+			if sub != nil {
+				wg.Add(1)
+				go func(c *Client) {
+					defer wg.Done()
+					c.Stop()
+				}(sub)
+			}
 		}
-	}
-	for _, client := range subscribers {
-		if client != nil {
-			client.Stop()
-		}
-	}
+		wg.Wait()
+		
+		close(stopChan)
+	}()
 
-	wg.Wait()
+	// Wait for shutdown with timeout
+	select {
+	case <-stopChan:
+		fmt.Println("All clients stopped successfully")
+	case <-time.After(5 * time.Second):
+		fmt.Println("Shutdown timed out")
+	}
 
 	// Print final statistics
-	elapsed := time.Since(startTime).Seconds()
-	fmt.Printf("\n=== Final Test Results ===\n")
-	fmt.Printf("Total Publishers: %d\n", config.NumClients)
-	fmt.Printf("Total Subscribers: %d\n", config.SubClients)
-	fmt.Printf("Test Duration: %.2f seconds\n", elapsed)
-	
-	fmt.Printf("\n=== Message Statistics ===\n")
-	fmt.Printf("Total Messages Published: %d\n", stats.PublishedMessages)
-	fmt.Printf("Total Messages Received: %d\n", stats.ReceivedMessages)
-	lossCount := stats.PublishedMessages - stats.ReceivedMessages
-	lossRate := 100 - float64(stats.ReceivedMessages)/float64(stats.PublishedMessages)*100
-	fmt.Printf("Messages Lost: %d (%.2f%%)\n", lossCount, lossRate)
-	fmt.Printf("Dropped Messages: %d\n", stats.DroppedMessages)
-	fmt.Printf("Duplicate Messages: %d\n", stats.DuplicateMessages)
-	fmt.Printf("Out of Order Messages: %d\n", stats.OutOfOrderMessages)
-	fmt.Printf("Processing Errors: %d\n", stats.ProcessingErrors)
-	
-	fmt.Printf("\n=== Performance Metrics ===\n")
-	fmt.Printf("Average Publishing Rate: %.2f msg/sec\n",
-		float64(stats.PublishedMessages)/elapsed)
-	fmt.Printf("Average Receiving Rate: %.2f msg/sec\n",
-		float64(stats.ReceivedMessages)/elapsed)
-	fmt.Printf("Average Publishing Rate Per Channel: %.2f msg/sec\n",
-		float64(stats.PublishedMessages)/(elapsed*float64(config.NumClients)))
-	fmt.Printf("Average Receiving Rate Per Channel: %.2f msg/sec\n",
-		float64(stats.ReceivedMessages)/(elapsed*float64(config.SubClients)))
-	
-	fmt.Printf("\n=== Error Statistics ===\n")
-	fmt.Printf("Total Errors: %d\n", stats.Errors)
-	fmt.Printf("Retry Attempts: %d\n", stats.RetryAttempts)
-	fmt.Printf("Successful Retries: %d\n", stats.RetrySuccesses)
-	fmt.Printf("Timeout Errors: %d\n", stats.TimeoutErrors)
-	fmt.Printf("Connection Errors: %d\n", stats.ConnectionErrors)
-	
-	if stats.RetryAttempts > 0 {
-		fmt.Printf("Retry Success Rate: %.2f%%\n", 
-			float64(stats.RetrySuccesses)/float64(stats.RetryAttempts)*100)
-	}
+	printFinalStats(stats, config, time.Since(startTime).Seconds())
+}
+
+func printFinalStats(stats *Stats, config *Config, elapsed float64) {
+    fmt.Printf("\n=== Final Test Results ===\n")
+    fmt.Printf("Total Publishers: %d\n", config.NumClients)
+    fmt.Printf("Total Subscribers: %d\n", config.SubClients)
+    fmt.Printf("Test Duration: %.2f seconds\n", elapsed)
+    
+    fmt.Printf("\n=== Message Statistics ===\n")
+    fmt.Printf("Total Messages Published: %d\n", stats.PublishedMessages)
+    fmt.Printf("Total Messages Received: %d\n", stats.ReceivedMessages)
+    lossCount := stats.PublishedMessages - stats.ReceivedMessages
+    lossRate := 100 - float64(stats.ReceivedMessages)/float64(stats.PublishedMessages)*100
+    fmt.Printf("Messages Lost: %d (%.2f%%)\n", lossCount, lossRate)
+    fmt.Printf("Dropped Messages: %d\n", stats.DroppedMessages)
+    fmt.Printf("Duplicate Messages: %d\n", stats.DuplicateMessages)
+    fmt.Printf("Out of Order Messages: %d\n", stats.OutOfOrderMessages)
+    fmt.Printf("Processing Errors: %d\n", stats.ProcessingErrors)
+    
+    fmt.Printf("\n=== Performance Metrics ===\n")
+    fmt.Printf("Average Publishing Rate: %.2f msg/sec\n",
+        float64(stats.PublishedMessages)/elapsed)
+    fmt.Printf("Average Receiving Rate: %.2f msg/sec\n",
+        float64(stats.ReceivedMessages)/elapsed)
+    fmt.Printf("Average Publishing Rate Per Channel: %.2f msg/sec\n",
+        float64(stats.PublishedMessages)/(elapsed*float64(config.NumClients)))
+    fmt.Printf("Average Receiving Rate Per Channel: %.2f msg/sec\n",
+        float64(stats.ReceivedMessages)/(elapsed*float64(config.SubClients)))
+    
+    fmt.Printf("\n=== Error Statistics ===\n")
+    fmt.Printf("Total Errors: %d\n", stats.Errors)
+    fmt.Printf("Retry Attempts: %d\n", stats.RetryAttempts)
+    fmt.Printf("Successful Retries: %d\n", stats.RetrySuccesses)
+    fmt.Printf("Timeout Errors: %d\n", stats.TimeoutErrors)
+    fmt.Printf("Connection Errors: %d\n", stats.ConnectionErrors)
+    
+    if stats.RetryAttempts > 0 {
+        fmt.Printf("Retry Success Rate: %.2f%%\n", 
+            float64(stats.RetrySuccesses)/float64(stats.RetryAttempts)*100)
+    }
 }

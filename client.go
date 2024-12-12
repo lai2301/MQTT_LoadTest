@@ -129,11 +129,14 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetOrderMatters(false).
 		SetConnectTimeout(10 * time.Second).
 		SetWriteTimeout(5 * time.Second).
-		SetMessageChannelDepth(100).
+		SetMessageChannelDepth(1000).
 		SetResumeSubs(true).
 		SetConnectRetry(true).
 		SetMaxReconnectInterval(time.Second).
 		SetAutoReconnect(true).
+		SetCleanSession(true).
+		SetConnectRetryInterval(time.Second).
+		SetStore(mqtt.NewMemoryStore()).
 		SetOnConnectHandler(func(client mqtt.Client) {
 			fmt.Printf("Client %s connected successfully at %v\n", 
 				clientID, time.Now().Format("15:04:05.000"))
@@ -141,6 +144,9 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetConnectionLostHandler(func(client mqtt.Client, err error) {
 			fmt.Printf("Connection lost for client %s at %v: %v\n", 
 				clientID, time.Now().Format("15:04:05.000"), err)
+			stats.mutex.Lock()
+			stats.ConnectionErrors++
+			stats.mutex.Unlock()
 		}).
 		SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
 			fmt.Printf("Client %s attempting to reconnect at %v\n", 
@@ -218,30 +224,65 @@ func (c *Client) subscribeLoop() {
 		}()
 	}
 
-	token := c.client.Subscribe(c.topic, byte(c.config.QoS), func(client mqtt.Client, msg mqtt.Message) {
-		select {
-		case msgChan <- msg:
-			// Message queued for processing
-		default:
-			c.stats.mutex.Lock()
-			c.stats.DroppedMessages++
-			c.stats.mutex.Unlock()
+	// Subscription function
+	subscribe := func() error {
+		if !c.client.IsConnected() {
+			return fmt.Errorf("client not connected")
 		}
-	})
 
-	if token.Wait() && token.Error() != nil {
-		c.stats.mutex.Lock()
-		c.stats.Errors++
-		c.stats.mutex.Unlock()
-		fmt.Printf("Error subscribing to topic %s: %v\n", c.topic, token.Error())
-		return
+		token := c.client.Subscribe(c.topic, byte(c.config.QoS), func(client mqtt.Client, msg mqtt.Message) {
+			select {
+			case msgChan <- msg:
+				// Message queued for processing
+			default:
+				c.stats.mutex.Lock()
+				c.stats.DroppedMessages++
+				c.stats.mutex.Unlock()
+			}
+		})
+
+		if token.Wait() && token.Error() != nil {
+			return token.Error()
+		}
+		return nil
 	}
 
-	<-c.stopChan
+	// Initial subscription
+	if err := subscribe(); err != nil {
+		fmt.Printf("Initial subscription failed for %s: %v\n", c.ID, err)
+	}
 
-	// Clean unsubscribe
-	if token := c.client.Unsubscribe(c.topic); token.Wait() && token.Error() != nil {
-		fmt.Printf("Error unsubscribing from topic %s: %v\n", c.topic, token.Error())
+	// Create reconnection ticker
+	reconnectTicker := time.NewTicker(time.Second)
+	defer reconnectTicker.Stop()
+
+	for {
+		select {
+		case <-c.stopChan:
+			// Clean unsubscribe only if connected
+			if c.client.IsConnected() {
+				if token := c.client.Unsubscribe(c.topic); token.Wait() && token.Error() != nil {
+					fmt.Printf("Error unsubscribing from topic %s: %v\n", c.topic, token.Error())
+				}
+			}
+			close(msgChan)
+			return
+
+		case <-reconnectTicker.C:
+			if !c.client.IsConnected() {
+				fmt.Printf("Client %s disconnected, attempting to reconnect...\n", c.ID)
+				if token := c.client.Connect(); token.Wait() && token.Error() != nil {
+					fmt.Printf("Reconnection failed for %s: %v\n", c.ID, token.Error())
+					continue
+				}
+				// Resubscribe after reconnection
+				if err := subscribe(); err != nil {
+					fmt.Printf("Resubscription failed for %s: %v\n", c.ID, err)
+				} else {
+					fmt.Printf("Client %s successfully reconnected and resubscribed\n", c.ID)
+				}
+			}
+		}
 	}
 }
 
@@ -276,6 +317,12 @@ func (c *Client) processMessage(msg mqtt.Message) {
 }
 
 func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay time.Duration) error {
+	if !c.client.IsConnected() {
+		c.stats.mutex.Lock()
+		c.stats.ConnectionErrors++
+		c.stats.mutex.Unlock()
+		return fmt.Errorf("client not connected")
+	}
 	var lastErr error
 	for i := 0; i <= maxRetries; i++ {
 		token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
@@ -378,9 +425,20 @@ func (c *Client) publishLoop() {
 }
 
 func (c *Client) Stop() {
+	// Signal stop to all goroutines
 	close(c.stopChan)
+
+	// Give subscribers time to process remaining messages
+	time.Sleep(100 * time.Millisecond)
+
 	if c.isSubscriber {
-		c.client.Unsubscribe(c.topic)
+		// Only attempt to unsubscribe if connected
+		if c.client.IsConnected() {
+			token := c.client.Unsubscribe(c.topic)
+			token.WaitTimeout(2 * time.Second) // Wait with timeout for unsubscribe to complete
+		}
 	}
-	c.client.Disconnect(250)
+
+	// Disconnect with a longer quiesce time
+	c.client.Disconnect(1000) // 1 second to complete pending work
 }
