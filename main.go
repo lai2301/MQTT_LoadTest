@@ -14,7 +14,12 @@ func main() {
 	config := LoadConfig()
 
 	// Ensure we have equal numbers of publishers and subscribers
-	config.NumClients = config.SubClients
+	if config.NumClients != config.SubClients {
+		config.NumClients = config.SubClients
+	}
+
+	// Verify the publish rate is being set correctly
+	fmt.Printf("Publishing rate per client: %d messages/second\n", config.PublishRate)
 
 	stats := NewStats()
 

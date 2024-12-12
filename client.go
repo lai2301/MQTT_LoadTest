@@ -23,6 +23,7 @@ type Client struct {
 	topic        string
 	clientIndex  int
 	startTime    time.Time
+	TestDuration int
 }
 
 type Stats struct {
@@ -127,11 +128,23 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetMaxReconnectInterval(1 * time.Second).
 		SetOrderMatters(false).
 		SetConnectTimeout(10 * time.Second).
+		SetWriteTimeout(5 * time.Second).
+		SetMessageChannelDepth(100).
+		SetResumeSubs(true).
+		SetConnectRetry(true).
+		SetMaxReconnectInterval(time.Second).
+		SetAutoReconnect(true).
 		SetOnConnectHandler(func(client mqtt.Client) {
-			fmt.Printf("Client %s connected successfully\n", clientID)
+			fmt.Printf("Client %s connected successfully at %v\n", 
+				clientID, time.Now().Format("15:04:05.000"))
 		}).
 		SetConnectionLostHandler(func(client mqtt.Client, err error) {
-			fmt.Printf("Connection lost for client %s: %v\n", clientID, err)
+			fmt.Printf("Connection lost for client %s at %v: %v\n", 
+				clientID, time.Now().Format("15:04:05.000"), err)
+		}).
+		SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
+			fmt.Printf("Client %s attempting to reconnect at %v\n", 
+				clientID, time.Now().Format("15:04:05.000"))
 		})
 
 	// Configure TLS if using SSL
@@ -175,6 +188,7 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		topic:        topic,
 		clientIndex:  id / 2,
 		startTime:    time.Time{},
+		TestDuration: config.TestDuration,
 	}, nil
 }
 
@@ -265,8 +279,14 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 	var lastErr error
 	for i := 0; i <= maxRetries; i++ {
 		token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
+		
 		if token.WaitTimeout(5 * time.Second) {
-			if token.Error() == nil {
+			if err := token.Error(); err != nil {
+				lastErr = err
+				if i == maxRetries {
+					fmt.Printf("Client %s - Final publish attempt failed: %v\n", c.ID, err)
+				}
+			} else {
 				c.stats.mutex.Lock()
 				c.stats.PublishedMessages++
 				if i > 0 {
@@ -276,20 +296,21 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 				c.stats.mutex.Unlock()
 				return nil
 			}
-			lastErr = token.Error()
-			if strings.Contains(lastErr.Error(), "timeout") {
-				c.stats.mutex.Lock()
-				c.stats.TimeoutErrors++
-				c.stats.mutex.Unlock()
-			} else {
-				c.stats.mutex.Lock()
-				c.stats.ConnectionErrors++
-				c.stats.mutex.Unlock()
-			}
 		} else {
 			lastErr = fmt.Errorf("publish timeout")
+			if i == maxRetries {
+				fmt.Printf("Client %s - Final publish attempt timed out\n", c.ID)
+			}
+		}
+
+		// Update error statistics
+		if strings.Contains(lastErr.Error(), "timeout") {
 			c.stats.mutex.Lock()
 			c.stats.TimeoutErrors++
+			c.stats.mutex.Unlock()
+		} else {
+			c.stats.mutex.Lock()
+			c.stats.ConnectionErrors++
 			c.stats.mutex.Unlock()
 		}
 
@@ -298,7 +319,6 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 			c.stats.RetryAttempts++
 			c.stats.mutex.Unlock()
 			time.Sleep(retryDelay)
-			fmt.Printf("Retrying publish for client %s (attempt %d/%d)\n", c.ID, i+2, maxRetries+1)
 		}
 	}
 	return lastErr
@@ -309,10 +329,6 @@ func (c *Client) publishLoop() {
 		time.Sleep(time.Until(c.startTime))
 	}
 
-	publishInterval := time.Second / time.Duration(c.config.PublishRate)
-	ticker := time.NewTicker(publishInterval)
-	defer ticker.Stop()
-
 	// Pre-allocate payloads
 	const poolSize = 1000
 	payloadPool := make([][]byte, poolSize)
@@ -321,82 +337,43 @@ func (c *Client) publishLoop() {
 		_, _ = rand.Read(payloadPool[i][16:]) // Leave space for timestamp and msgID
 	}
 
-	// Larger buffer for publish channel
-	publishChan := make(chan []byte, poolSize)
-	
-	// More concurrent publishers
-	const numPublishers = 5
-	var publishWg sync.WaitGroup
-	
-	// Start multiple publisher goroutines
-	for i := 0; i < numPublishers; i++ {
-		publishWg.Add(1)
-		go func() {
-			defer publishWg.Done()
-			for payload := range publishChan {
-				if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay); err != nil {
-					c.stats.mutex.Lock()
-					c.stats.Errors++
-					c.stats.mutex.Unlock()
-				}
-			}
-		}()
-	}
-
 	messageID := uint64(0)
 	payloadIndex := 0
-	lastCount := uint64(0)
-	lastTime := time.Now()
-	
-	// Create batch of messages
-	const batchSize = 10
-	batch := make([][]byte, 0, batchSize)
+	startTime := time.Now()
+	publishInterval := time.Second / time.Duration(c.config.PublishRate)
 
+	fmt.Printf("Client %s - Starting publisher (rate: %d msg/sec, interval: %v)\n", 
+		c.ID, c.config.PublishRate, publishInterval)
+
+	// Main publishing loop
 	for {
 		select {
 		case <-c.stopChan:
-			close(publishChan)
-			publishWg.Wait()
 			return
-		case <-ticker.C:
-			// Update stats every second
-			if time.Since(lastTime) >= time.Second {
-				c.stats.mutex.Lock()
-				currentCount := c.stats.PublishedMessages
-				rate := float64(currentCount-lastCount) / time.Since(lastTime).Seconds()
-				c.stats.UpdateChannelRate(c.clientIndex, rate)
-				lastCount = currentCount
-				c.stats.mutex.Unlock()
-				lastTime = time.Now()
-			}
-
-			// Prepare batch of messages
-			batch = batch[:0]
-			for i := 0; i < batchSize; i++ {
-				messageID++
-				payload := payloadPool[payloadIndex]
-				payloadIndex = (payloadIndex + 1) % len(payloadPool)
-
-				// Update timestamp and message ID
-				timestamp := time.Now().UnixNano()
-				copy(payload[0:8], []byte(fmt.Sprintf("%08d", timestamp)))
-				copy(payload[8:16], []byte(fmt.Sprintf("%08d", messageID)))
-
-				batch = append(batch, append([]byte(nil), payload...))
-			}
-
-			// Send batch to publishers
-			for _, msg := range batch {
-				select {
-				case publishChan <- msg:
-					// Message queued successfully
-				default:
-					c.stats.mutex.Lock()
-					c.stats.DroppedMessages++
-					c.stats.mutex.Unlock()
-				}
-			}
+		default:
 		}
+
+		if time.Since(startTime) >= time.Duration(c.config.TestDuration)*time.Second {
+			return
+		}
+
+		messageID++
+		payload := make([]byte, c.config.MessageSize)
+		copy(payload, payloadPool[payloadIndex])
+		payloadIndex = (payloadIndex + 1) % len(payloadPool)
+
+		timestamp := time.Now().UnixNano()
+		copy(payload[0:8], []byte(fmt.Sprintf("%08d", timestamp)))
+		copy(payload[8:16], []byte(fmt.Sprintf("%08d", messageID)))
+
+		if err := c.publishWithRetry(payload, DefaultClientOptions().MaxRetries, DefaultClientOptions().RetryDelay); err != nil {
+			c.stats.mutex.Lock()
+			c.stats.Errors++
+			c.stats.mutex.Unlock()
+			fmt.Printf("Client %s - Publish error: %v\n", c.ID, err)
+		}
+
+		time.Sleep(publishInterval)
 	}
 }
 
