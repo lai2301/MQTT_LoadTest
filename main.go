@@ -14,12 +14,28 @@ import (
 func main() {
 	config := LoadConfig()
 
-	// Ensure we have equal numbers of publishers and subscribers
-	if config.NumClients != config.SubClients {
-		config.NumClients = config.SubClients
+	// Validate and adjust client numbers based on mode
+	switch config.TestMode {
+	case ModePairwise:
+		// In pairwise mode, ignore sub-clients parameter and match with publishers
+		config.SubClients = config.NumClients
+		fmt.Printf("Pairwise mode: Setting subscribers equal to publishers (%d)\n", config.NumClients)
+	
+	case ModeNToOne:
+		if config.SubClients != 1 {
+			fmt.Printf("N-to-1 mode: Setting number of subscribers to 1\n")
+			config.SubClients = 1
+		}
+	
+	case ModeOneToN:
+		if config.NumClients != 1 {
+			fmt.Printf("1-to-N mode: Setting number of publishers to 1\n")
+			config.NumClients = 1
+		}
 	}
 
-	// Verify the publish rate is being set correctly
+	fmt.Printf("Test Mode: %s\n", config.TestMode)
+	fmt.Printf("Publishers: %d, Subscribers: %d\n", config.NumClients, config.SubClients)
 	fmt.Printf("Publishing rate per client: %d messages/second\n", config.PublishRate)
 
 	stats := NewStats()
@@ -38,8 +54,8 @@ func main() {
 	subscribers := make([]*Client, config.SubClients)
 	var wg sync.WaitGroup
 
-	// Create subscriber clients in parallel
-	fmt.Printf("Initializing %d pairs of publishers and subscribers...\n", config.SubClients)
+	// Create subscriber clients
+	fmt.Printf("Initializing %d subscriber(s)...\n", config.SubClients)
 	subWg := sync.WaitGroup{}
 	subChan := make(chan error, config.SubClients)
 
@@ -47,7 +63,7 @@ func main() {
 		subWg.Add(1)
 		go func(index int) {
 			defer subWg.Done()
-			client, err := NewClient(index*2, config, stats, true)
+			client, err := NewClient(index, config, stats, true)
 			if err != nil {
 				fmt.Printf("Error creating subscriber %d: %v\n", index, err)
 				subChan <- err
@@ -76,8 +92,8 @@ func main() {
 	// Increase wait time for subscribers to connect and subscribe
 	time.Sleep(3 * time.Second)
 
-	// Create publisher clients in parallel
-	fmt.Printf("Creating %d publisher clients...\n", config.NumClients)
+	// Create publisher clients
+	fmt.Printf("Creating %d publisher(s)...\n", config.NumClients)
 	pubWg := sync.WaitGroup{}
 	pubChan := make(chan error, config.NumClients)
 
@@ -85,7 +101,7 @@ func main() {
 		pubWg.Add(1)
 		go func(index int) {
 			defer pubWg.Done()
-			client, err := NewClient(index*2+1, config, stats, false)
+			client, err := NewClient(index, config, stats, false)
 			if err != nil {
 				fmt.Printf("Error creating publisher %d: %v\n", index, err)
 				pubChan <- err
