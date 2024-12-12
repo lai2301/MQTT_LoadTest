@@ -16,7 +16,7 @@ A high-performance load testing tool for MQTT brokers, supporting various testin
 
 ## Installation
 ```bash
-git clone https://github.com/yourusername/mqtt-load-tester
+git clone https://github.com/lai2301/mqtt-load-tester
 cd mqtt-load-tester
 go build
 ```
