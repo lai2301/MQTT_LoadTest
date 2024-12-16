@@ -2,12 +2,12 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"crypto/tls"
-	"strings"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -27,23 +27,23 @@ type Client struct {
 }
 
 type Stats struct {
-	PublishedMessages uint64
-	ReceivedMessages  uint64
-	Errors            uint64
-	RetryAttempts     uint64    // Track total retry attempts
-	RetrySuccesses    uint64    // Track successful retries
-	TimeoutErrors     uint64    // Track timeout errors
-	ConnectionErrors  uint64    // Track connection-related errors
-	ReconnectCount   uint64    // Track number of reconnections
-	DroppedMessages  uint64    // Track messages dropped by subscriber
-	DuplicateMessages uint64   // Track duplicate messages
-	OutOfOrderMessages uint64  // Track out-of-order messages
-	ProcessingErrors uint64    // Track message processing errors
-	LastPublished     map[int]time.Time
-	LastReceived      map[int]time.Time
-	ChannelStats      map[int]*ChannelStat
-	LastMessageID    map[int]uint64  // Track last message ID per channel
-	mutex             sync.Mutex
+	PublishedMessages  uint64
+	ReceivedMessages   uint64
+	Errors             uint64
+	RetryAttempts      uint64 // Track total retry attempts
+	RetrySuccesses     uint64 // Track successful retries
+	TimeoutErrors      uint64 // Track timeout errors
+	ConnectionErrors   uint64 // Track connection-related errors
+	ReconnectCount     uint64 // Track number of reconnections
+	DroppedMessages    uint64 // Track messages dropped by subscriber
+	DuplicateMessages  uint64 // Track duplicate messages
+	OutOfOrderMessages uint64 // Track out-of-order messages
+	ProcessingErrors   uint64 // Track message processing errors
+	LastPublished      map[int]time.Time
+	LastReceived       map[int]time.Time
+	ChannelStats       map[int]*ChannelStat
+	LastMessageID      map[int]uint64 // Track last message ID per channel
+	mutex              sync.Mutex
 }
 
 type ChannelStat struct {
@@ -56,21 +56,21 @@ type ChannelStat struct {
 }
 
 type ClientOptions struct {
-	MaxInflight     int
-	BatchSize       int
-	PublishTimeout  time.Duration
-	ConnectTimeout  time.Duration
-	MaxRetries      int
+	MaxInflight    int
+	BatchSize      int
+	PublishTimeout time.Duration
+	ConnectTimeout time.Duration
+	MaxRetries     int
 	RetryDelay     time.Duration
 }
 
 func DefaultClientOptions() ClientOptions {
 	return ClientOptions{
-		MaxInflight:     100,
-		BatchSize:       10,
-		PublishTimeout:  5 * time.Second,
-		ConnectTimeout:  10 * time.Second,
-		MaxRetries:      3,
+		MaxInflight:    100,
+		BatchSize:      10,
+		PublishTimeout: 5 * time.Second,
+		ConnectTimeout: 10 * time.Second,
+		MaxRetries:     3,
 		RetryDelay:     100 * time.Millisecond,
 	}
 }
@@ -109,7 +109,7 @@ func (s *Stats) UpdateChannelRate(channelID int, rate float64) {
 }
 
 func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client, error) {
-	clientID := generateClientID(id, config.TestMode, isSubscriber)
+	clientID := generateClientID(id, isSubscriber, config)
 	topic := generateTopic(id, config.TestMode, config.TopicPrefix, isSubscriber)
 
 	opts := mqtt.NewClientOptions().
@@ -123,7 +123,7 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetPingTimeout(10 * time.Second).
 		SetConnectTimeout(10 * time.Second).
 		SetWriteTimeout(5 * time.Second).
-		SetMaxReconnectInterval(1 *time.Second).
+		SetMaxReconnectInterval(1 * time.Second).
 		SetConnectRetryInterval(time.Second).
 		SetConnectRetry(true).
 		SetResumeSubs(config.ResumeSubs).
@@ -131,12 +131,12 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 		SetMessageChannelDepth(config.MessageChannelDepth).
 		SetStore(mqtt.NewMemoryStore()).
 		SetOnConnectHandler(func(client mqtt.Client) {
-			fmt.Printf("Client %s connected successfully at %v\n", 
+			fmt.Printf("Client %s connected successfully at %v\n",
 				clientID, time.Now().Format("15:04:05.000"))
 		}).
 		SetConnectionLostHandler(func(client mqtt.Client, err error) {
 			if !strings.Contains(err.Error(), "EOF") {
-				fmt.Printf("Connection lost for client %s at %v: %v\n", 
+				fmt.Printf("Connection lost for client %s at %v: %v\n",
 					clientID, time.Now().Format("15:04:05.000"), err)
 			}
 			stats.mutex.Lock()
@@ -144,7 +144,7 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 			stats.mutex.Unlock()
 		}).
 		SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
-			fmt.Printf("Client %s attempting to reconnect at %v\n", 
+			fmt.Printf("Client %s attempting to reconnect at %v\n",
 				clientID, time.Now().Format("15:04:05.000"))
 		})
 
@@ -152,9 +152,9 @@ func NewClient(id int, config *Config, stats *Stats, isSubscriber bool) (*Client
 	if strings.HasPrefix(config.BrokerURL, "ssl://") {
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: config.InsecureSkipVerify,
-			MinVersion:       tls.VersionTLS12,
-			MaxVersion:       tls.VersionTLS13,
-			Renegotiation:    tls.RenegotiateNever,
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
+			Renegotiation:      tls.RenegotiateNever,
 		}
 		opts.SetTLSConfig(tlsConfig)
 	}
@@ -211,7 +211,7 @@ func (c *Client) SetStartTime(t time.Time) {
 func (c *Client) subscribeLoop() {
 	// Create message processing channel with large buffer
 	msgChan := make(chan mqtt.Message, 1000)
-	
+
 	// Start multiple message processors
 	const numProcessors = 5
 	for i := 0; i < numProcessors; i++ {
@@ -272,7 +272,7 @@ func (c *Client) subscribeLoop() {
 				c.stats.mutex.Lock()
 				c.stats.ReconnectCount++
 				c.stats.mutex.Unlock()
-				
+
 				if token := c.client.Connect(); token.Wait() && token.Error() != nil {
 					fmt.Printf("Reconnection failed for %s: %v\n", c.ID, token.Error())
 					continue
@@ -310,7 +310,7 @@ func (c *Client) processMessage(msg mqtt.Message) {
 		// In N-to-1 mode, don't check for duplicates
 		c.stats.ReceivedMessages++
 		c.stats.LastReceived[c.clientIndex] = time.Now()
-		
+
 	case ModeManyToMany:
 		// Extract publisher ID from topic
 		parts := strings.Split(msg.Topic(), "/")
@@ -330,11 +330,11 @@ func (c *Client) processMessage(msg mqtt.Message) {
 			// Skip duplicate messages from same publisher
 			return
 		}
-		
+
 		c.stats.LastMessageID[pubID] = msgID
 		c.stats.ReceivedMessages++
 		c.stats.LastReceived[c.clientIndex] = time.Now()
-		
+
 	default:
 		// For other modes, check for duplicates and order
 		lastID, exists := c.stats.LastMessageID[c.clientIndex]
@@ -364,7 +364,7 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 	var lastErr error
 	for i := 0; i <= maxRetries; i++ {
 		token := c.client.Publish(c.topic, byte(c.config.QoS), c.config.RetainMessage, payload)
-		
+
 		if token.WaitTimeout(5 * time.Second) {
 			if err := token.Error(); err != nil {
 				lastErr = err
@@ -376,7 +376,7 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 					c.stats.ConnectionErrors++
 				}
 				c.stats.mutex.Unlock()
-				
+
 				if i == maxRetries {
 					fmt.Printf("Client %s - Final publish attempt failed: %v\n", c.ID, err)
 				}
@@ -396,7 +396,7 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 			c.stats.TimeoutErrors++
 			c.stats.Errors++
 			c.stats.mutex.Unlock()
-			
+
 			if i == maxRetries {
 				fmt.Printf("Client %s - Final publish attempt timed out\n", c.ID)
 			}
@@ -406,7 +406,7 @@ func (c *Client) publishWithRetry(payload []byte, maxRetries int, retryDelay tim
 			c.stats.mutex.Lock()
 			c.stats.RetryAttempts++
 			c.stats.mutex.Unlock()
-			
+
 			time.Sleep(retryDelay)
 		}
 	}
@@ -441,7 +441,7 @@ func (c *Client) publishLoop() {
 		topics = []string{c.topic}
 	}
 
-	fmt.Printf("Client %s - Starting publisher (rate: %d msg/sec, interval: %v)\n", 
+	fmt.Printf("Client %s - Starting publisher (rate: %d msg/sec, interval: %v)\n",
 		c.ID, c.config.PublishRate, publishInterval)
 
 	// Main publishing loop
@@ -520,10 +520,10 @@ func generateTopic(id int, mode TestMode, prefix string, isSubscriber bool) stri
 	}
 }
 
-func generateClientID(id int, mode TestMode, isSubscriber bool) string {
-	prefix := "loadtest-pub-"
+func generateClientID(id int, isSubscriber bool, config *Config) string {
+	prefix := "pub-"
 	if isSubscriber {
-		prefix = "loadtest-sub-"
+		prefix = "sub-"
 	}
-	return fmt.Sprintf("%s%d", prefix, id)
+	return fmt.Sprintf("%s%s%d", config.ClientIDPrefix, prefix, id)
 }
